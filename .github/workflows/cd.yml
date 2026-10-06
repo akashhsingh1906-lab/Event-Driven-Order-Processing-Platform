@@ -1,0 +1,79 @@
+name: CD — Build & Push Images
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publish:
+    name: Jib build + push to GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: m2-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            m2-${{ runner.os }}-
+
+      - name: Compute lowercase owner
+        id: owner
+        run: echo "lower=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Compile and install all modules (incl. shared/common) to local m2
+        run: mvn -B -ntp -DskipTests install
+
+      - name: Build images and push to GHCR (Jib, services only)
+        id: jib
+        env:
+          JIB_USER: ${{ github.actor }}
+          JIB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Image name (ghcr.io/eaaslan/ecommerce-<artifactId>) lives in the
+          # parent pom's <pluginManagement>; Maven substitutes ${project.artifactId}
+          # per module. Don't override via -Djib.to.image= — system properties are
+          # literal strings and Maven won't interpolate them.
+          # shared/common is excluded — it's a JAR library, not a service.
+          mvn -B -ntp -DskipTests \
+            -pl '!shared/common' \
+            -Djib.to.auth.username="$JIB_USER" \
+            -Djib.to.auth.password="$JIB_TOKEN" \
+            -Djib.to.tags="${{ github.sha }},latest" \
+            jib:build
+
+      - name: Notify Slack — success
+        if: success() && env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d '{
+              "text": ":rocket: *Deploy succeeded* — `${{ github.sha }}`\n*Author:* ${{ github.actor }}\n*Message:* ${{ github.event.head_commit.message }}\n<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }' \
+            "$SLACK_WEBHOOK_URL"
+
+      - name: Notify Slack — failure
+        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d '{
+              "text": ":x: *Deploy failed* — `${{ github.sha }}`\n*Author:* ${{ github.actor }}\n<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>"
+            }' \
+            "$SLACK_WEBHOOK_URL"
